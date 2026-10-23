@@ -17,9 +17,9 @@ A secure, scalable backend and moderation pipeline for a TV tracking and social 
 +-- infra/               # Docker Compose stack, Caddyfile, environment configurations
 +-- scripts/             # Health checks, VPS security hardening, database maintenance
 +-- supabase/
-¦   +-- functions/       # Deno/TypeScript Edge Functions (tmdb-proxy, moderation, auth)
-¦   +-- migrations/      # Versioned idempotent SQL migrations & RLS policies
-¦   +-- tests/           # Automated SQL RLS test suites
+Â¦   +-- functions/       # Deno/TypeScript Edge Functions (tmdb-proxy, moderation, auth)
+Â¦   +-- migrations/      # Versioned idempotent SQL migrations & RLS policies
+Â¦   +-- tests/           # Automated SQL RLS test suites
 +-- worker/              # FastAPI background moderation service + Redis queue
 `
 
@@ -27,5 +27,5 @@ A secure, scalable backend and moderation pipeline for a TV tracking and social 
 - Row Level Security (RLS) enabled on every public table.
 - UUID primary keys throughout; zero sequential IDs.
 - Client never sees the service role key.
-- Soft-delete pattern with immutable moderation audit trails.
+- Soft-delete pattern with tamper-resistant moderation audit trails.
 - Zero-trust input validation with CHECK constraints and Zod schemas.
