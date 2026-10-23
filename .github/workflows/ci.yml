@@ -7,7 +7,7 @@ on:
     branches: [ '**' ]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   db-migrations-and-rls-tests:
@@ -17,57 +17,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Run Complete Test Pipeline and Record Output
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.122.0
+
+      - name: Run Official Supabase Test Suite
         run: |
-          set +e
-          exec > test_run.log 2>&1
-          echo "=== 1. Starting PostgreSQL 15 Container ==="
-          docker run -d --name postgres-test -p 5432:5432 -e POSTGRES_PASSWORD=postgrespassword -e POSTGRES_DB=postgres postgres:15-alpine
-          until docker exec postgres-test pg_isready -U postgres -d postgres; do
-            echo "Waiting for PostgreSQL..."
-            sleep 1
-          done
-          echo "PostgreSQL is ready!"
-
-          echo "=== 2. Applying Mock Auth & pg_cron Setup ==="
-          docker exec -i postgres-test psql -U postgres -d postgres -v ON_ERROR_STOP=1 < supabase/tests/00_setup_auth_mock.sql
-          MOCK_EXIT=$?
-          echo "Mock setup exit: $MOCK_EXIT"
-
-          echo "=== 3. Applying Migrations ==="
-          for file in $(ls -1 supabase/migrations/*.sql | sort); do
-            echo "--- Applying migration: $file ---"
-            docker exec -i postgres-test psql -U postgres -d postgres -v ON_ERROR_STOP=1 < "$file"
-            MIG_EXIT=$?
-            echo "Migration $file exit: $MIG_EXIT"
-            if [ $MIG_EXIT -ne 0 ]; then
-              break
-            fi
-          done
-
-          echo "=== 4. Executing Phase 1 Test Matrix ==="
-          docker exec -i postgres-test psql -U postgres -d postgres -v ON_ERROR_STOP=1 < supabase/tests/01_phase1_rls_test.sql
-          TEST_EXIT=$?
-          echo "Test suite exit: $TEST_EXIT"
-
-          echo "=== Pipeline Completed with Overall Status ==="
-
-      - name: Commit and Push Test Log
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add test_run.log
-          git commit -m "chore(ci): upload raw test execution log [skip ci]" || true
-          git push origin phase-1 || true
-
-      - name: Assert Test Pipeline Succeeded
-        run: |
-          cat test_run.log
-          if grep -q "ALL 12 SECURITY, INTEGRITY & CONSTRAINT TESTS PASSED" test_run.log; then
-            echo "VERIFIED: Test suite passed successfully!"
-            exit 0
-          else
-            echo "FAILED: Test suite did not reach success notice."
-            exit 1
-          fi
+          chmod +x scripts/test.sh
+          ./scripts/test.sh

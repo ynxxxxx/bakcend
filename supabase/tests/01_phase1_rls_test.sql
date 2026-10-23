@@ -1,32 +1,55 @@
 -- ==============================================================================
 -- Test Suite: 01_phase1_rls_test.sql
 -- Description: Phase 1 Exhaustive Security, Escalation & Constraint Test Matrix
+-- Target: Real Supabase Stack (PostgreSQL 15+ with auth schema & PostgREST JWT)
 -- ==============================================================================
 
 BEGIN;
 
-CREATE OR REPLACE FUNCTION set_actor(actor_id UUID, actor_role TEXT DEFAULT 'authenticated')
+-- Helper to set execution role and PostgREST JWT claims
+CREATE OR REPLACE FUNCTION set_actor(
+    actor_id UUID, 
+    actor_role TEXT DEFAULT 'authenticated',
+    actor_aal TEXT DEFAULT 'aal1'
+)
 RETURNS VOID AS $$
+DECLARE
+    v_claims TEXT;
 BEGIN
     IF actor_id IS NULL THEN
+        SET LOCAL ROLE anon;
+        PERFORM set_config('request.jwt.claims', '{"role":"anon"}', true);
         PERFORM set_config('request.jwt.claim.sub', '', true);
         PERFORM set_config('request.jwt.claim.role', 'anon', true);
+        PERFORM set_config('request.jwt.claim.aal', 'aal1', true);
     ELSE
+        SET LOCAL ROLE authenticated;
+        v_claims := json_build_object(
+            'sub', actor_id::text,
+            'role', actor_role,
+            'email', actor_id::text || '@test.com',
+            'aal', actor_aal
+        )::text;
+        PERFORM set_config('request.jwt.claims', v_claims, true);
         PERFORM set_config('request.jwt.claim.sub', actor_id::text, true);
         PERFORM set_config('request.jwt.claim.role', actor_role, true);
+        PERFORM set_config('request.jwt.claim.aal', actor_aal, true);
     END IF;
 END;
 $$ LANGUAGE plpgsql;
 
--- 1. FIXTURE SETUP
-INSERT INTO auth.users (id, email, raw_user_meta_data)
+-- 1. FIXTURE SETUP: Insert into real auth.users
+INSERT INTO auth.users (
+    id, instance_id, aud, role, email, encrypted_password, email_confirmed_at,
+    raw_app_meta_data, raw_user_meta_data, created_at, updated_at
+)
 VALUES 
-    ('11111111-1111-1111-1111-111111111111', 'alice@test.com', '{"full_name": "Alice Wonderland"}'::jsonb),
-    ('22222222-2222-2222-2222-222222222222', 'bob@test.com', '{"full_name": "Bob Builder"}'::jsonb),
-    ('33333333-3333-3333-3333-333333333333', 'charlie@test.com', '{"full_name": "Charlie Chaplin"}'::jsonb),
-    ('44444444-4444-4444-4444-444444444444', 'dave@test.com', '{"full_name": "Dave Dangerous"}'::jsonb),
-    ('55555555-5555-5555-5555-555555555555', 'eve@test.com', '{"full_name": "Eve Administrator"}'::jsonb),
-    ('66666666-6666-6666-6666-666666666666', 'frank@test.com', '{"full_name": "Frank Scoped"}'::jsonb)
+    ('11111111-1111-1111-1111-111111111111', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'alice@test.com', '', now(), '{"provider":"email","providers":["email"]}'::jsonb, '{"full_name": "Alice Wonderland"}'::jsonb, now(), now()),
+    ('22222222-2222-2222-2222-222222222222', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'bob@test.com', '', now(), '{"provider":"email","providers":["email"]}'::jsonb, '{"full_name": "Bob Builder"}'::jsonb, now(), now()),
+    ('33333333-3333-3333-3333-333333333333', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'charlie@test.com', '', now(), '{"provider":"email","providers":["email"]}'::jsonb, '{"full_name": "Charlie Chaplin"}'::jsonb, now(), now()),
+    ('44444444-4444-4444-4444-444444444444', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'dave@test.com', '', now(), '{"provider":"email","providers":["email"]}'::jsonb, '{"full_name": "Dave Dangerous"}'::jsonb, now(), now()),
+    ('55555555-5555-5555-5555-555555555555', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'eve@test.com', '', now(), '{"provider":"email","providers":["email"]}'::jsonb, '{"full_name": "Eve Administrator"}'::jsonb, now(), now()),
+    ('66666666-6666-6666-6666-666666666666', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'frank@test.com', '', now(), '{"provider":"email","providers":["email"]}'::jsonb, '{"full_name": "Frank Scoped"}'::jsonb, now(), now())
 ON CONFLICT (id) DO NOTHING;
 
 UPDATE public.profiles SET username = 'alice', onboarded = true WHERE id = '11111111-1111-1111-1111-111111111111';
@@ -50,6 +73,16 @@ ON CONFLICT DO NOTHING;
 INSERT INTO public.bans (user_id, scope, community_id, reason, banned_by)
 VALUES ('66666666-6666-6666-6666-666666666666', 'community', gen_random_uuid(), 'Community ban only', '55555555-5555-5555-5555-555555555555')
 ON CONFLICT DO NOTHING;
+
+-- Report on pg_cron status without mocking
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        RAISE NOTICE 'pg_cron extension is NOT installed in this PostgreSQL stack';
+    ELSE
+        RAISE NOTICE 'pg_cron extension is verified present in this PostgreSQL stack';
+    END IF;
+END $$;
 
 -- ------------------------------------------------------------------------------
 -- TEST 1: Anonymous Access (Must not read private data or user_flags)
@@ -224,7 +257,6 @@ END $$;
 -- ------------------------------------------------------------------------------
 -- TEST 7: Append-Only Moderation Actions (Insert-only, No update/delete, No client access)
 -- ------------------------------------------------------------------------------
--- Normal client (Alice) cannot read or write to moderation_actions
 SELECT set_actor('11111111-1111-1111-1111-111111111111');
 DO $$
 DECLARE v_cnt INT;
