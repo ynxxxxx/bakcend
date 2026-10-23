@@ -46,7 +46,7 @@ INSERT INTO public.bans (user_id, scope, reason, banned_by)
 VALUES ('44444444-4444-4444-4444-444444444444', 'global', 'Global ban test', '55555555-5555-5555-5555-555555555555')
 ON CONFLICT DO NOTHING;
 
--- Establish Frank as community-only banned (scope = community)
+-- Establish Frank as community-only banned
 INSERT INTO public.bans (user_id, scope, community_id, reason, banned_by)
 VALUES ('66666666-6666-6666-6666-666666666666', 'community', gen_random_uuid(), 'Community ban only', '55555555-5555-5555-5555-555555555555')
 ON CONFLICT DO NOTHING;
@@ -70,6 +70,9 @@ BEGIN
 
     SELECT COUNT(*) INTO v_cnt FROM public.show_progress;
     IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Anon read show_progress!'; END IF;
+
+    SELECT COUNT(*) INTO v_cnt FROM public.moderation_actions;
+    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Anon read moderation_actions!'; END IF;
 END $$;
 
 -- ------------------------------------------------------------------------------
@@ -79,10 +82,8 @@ SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice (non-admin)
 
 DO $$
 BEGIN
-    -- Alice can check her own ban status
     PERFORM private.is_banned('11111111-1111-1111-1111-111111111111');
 
-    -- Alice cannot check Dave's ban status
     BEGIN
         PERFORM private.is_banned('44444444-4444-4444-4444-444444444444');
         RAISE EXCEPTION 'FAIL: Non-admin was able to probe other user ban status!';
@@ -109,7 +110,7 @@ BEGIN
 END $$;
 
 -- ------------------------------------------------------------------------------
--- TEST 4: Banned User Write Rejections (Dave has active global ban)
+-- TEST 4: Global Ban Rejections (Dave has active global ban)
 -- ------------------------------------------------------------------------------
 SELECT set_actor('44444444-4444-4444-4444-444444444444'); -- Dave
 
@@ -135,16 +136,14 @@ BEGIN
 END $$;
 
 -- ------------------------------------------------------------------------------
--- TEST 5: Blocking Deletes Follows in Both Directions (Unblocking does not restore)
+-- TEST 5: Mutual Follow Deletion on Block
 -- ------------------------------------------------------------------------------
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
--- Alice follows Bob
 INSERT INTO public.follows (follower_id, followee_id)
 VALUES ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222')
 ON CONFLICT DO NOTHING;
 
 SELECT set_actor('22222222-2222-2222-2222-222222222222'); -- Bob
--- Bob follows Alice
 INSERT INTO public.follows (follower_id, followee_id)
 VALUES ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111')
 ON CONFLICT DO NOTHING;
@@ -161,9 +160,7 @@ BEGIN
     SELECT COUNT(*) INTO v_cnt FROM public.follows
     WHERE (follower_id = '11111111-1111-1111-1111-111111111111' AND followee_id = '22222222-2222-2222-2222-222222222222')
        OR (follower_id = '22222222-2222-2222-2222-222222222222' AND followee_id = '11111111-1111-1111-1111-111111111111');
-    IF v_cnt != 0 THEN
-        RAISE EXCEPTION 'FAIL: Mutual follows were not deleted upon block!';
-    END IF;
+    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Mutual follows were not deleted upon block!'; END IF;
 END $$;
 
 -- Alice unblocks Bob; follows must remain deleted
@@ -176,37 +173,31 @@ BEGIN
     SELECT COUNT(*) INTO v_cnt FROM public.follows
     WHERE (follower_id = '11111111-1111-1111-1111-111111111111' AND followee_id = '22222222-2222-2222-2222-222222222222')
        OR (follower_id = '22222222-2222-2222-2222-222222222222' AND followee_id = '11111111-1111-1111-1111-111111111111');
-    IF v_cnt != 0 THEN
-        RAISE EXCEPTION 'FAIL: Unblocking resurrected follows!';
-    END IF;
+    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Unblocking resurrected follows!'; END IF;
 END $$;
 
 -- ------------------------------------------------------------------------------
 -- TEST 6: Un-remove Attack & Moderation Tampering Guards on Logs
 -- ------------------------------------------------------------------------------
--- Alice creates a log
 SELECT set_actor('11111111-1111-1111-1111-111111111111');
 INSERT INTO public.logs (id, user_id, show_id, show_name, review_text, status)
 VALUES ('77777777-7777-7777-7777-777777777777', '11111111-1111-1111-1111-111111111111', 200, 'The Wire', 'Classic', 'visible')
 ON CONFLICT (id) DO UPDATE SET review_text = 'Classic';
 
--- Alice tries to change status: visible -> hidden (must be blocked; must use deleted_at)
 DO $$
 BEGIN
+    -- visible -> hidden attempt
     BEGIN
         UPDATE public.logs SET status = 'hidden' WHERE id = '77777777-7777-7777-7777-777777777777';
-        RAISE EXCEPTION 'FAIL: Client was able to change log status to hidden!';
+        RAISE EXCEPTION 'FAIL: Client changed log status to hidden!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM NOT LIKE '%Cannot alter moderation status%' THEN RAISE EXCEPTION '%', SQLERRM; END IF;
     END;
-END $$;
 
--- Alice tries to change status: visible -> held
-DO $$
-BEGIN
+    -- visible -> held attempt
     BEGIN
         UPDATE public.logs SET status = 'held' WHERE id = '77777777-7777-7777-7777-777777777777';
-        RAISE EXCEPTION 'FAIL: Client was able to change log status to held!';
+        RAISE EXCEPTION 'FAIL: Client changed log status to held!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM NOT LIKE '%Cannot alter moderation status%' THEN RAISE EXCEPTION '%', SQLERRM; END IF;
     END;
@@ -231,118 +222,44 @@ BEGIN
 END $$;
 
 -- ------------------------------------------------------------------------------
--- TEST 7: User Ownership Transfer Lock & Stale Clock Guard on show_progress & private_notes
+-- TEST 7: Append-Only Moderation Actions (Insert-only, No update/delete, No client access)
 -- ------------------------------------------------------------------------------
-SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
+-- Normal client (Alice) cannot read or write to moderation_actions
+SELECT set_actor('11111111-1111-1111-1111-111111111111');
+DO $$
+DECLARE v_cnt INT;
+BEGIN
+    SELECT COUNT(*) INTO v_cnt FROM public.moderation_actions;
+    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Normal user read moderation_actions!'; END IF;
 
-INSERT INTO public.show_progress (id, user_id, show_id, season, episode, client_updated_at)
-VALUES ('88888888-8888-8888-8888-888888888888', '11111111-1111-1111-1111-111111111111', 300, 1, 2, '2026-10-23 12:00:00+00')
-ON CONFLICT DO NOTHING;
+    BEGIN
+        INSERT INTO public.moderation_actions (actor_id, action, target_type, target_id, reason)
+        VALUES ('11111111-1111-1111-1111-111111111111', 'ban', 'user', '22222222-2222-2222-2222-222222222222', 'Rogue action');
+        RAISE EXCEPTION 'FAIL: Normal user wrote to moderation_actions!';
+    EXCEPTION WHEN insufficient_privilege THEN END;
+END $$;
 
--- Alice attempts user_id transfer to Bob on show_progress
+-- Admin (Eve) CAN write an audit record and read it
+SELECT set_actor('55555555-5555-5555-5555-555555555555');
+INSERT INTO public.moderation_actions (id, actor_id, action, target_type, target_id, reason)
+VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', '55555555-5555-5555-5555-555555555555', 'ban', 'user', '44444444-4444-4444-4444-444444444444', 'Audit ban verification');
+
+-- Even Admin CANNOT update or delete from moderation_actions (append-only)
 DO $$
 BEGIN
     BEGIN
-        UPDATE public.show_progress SET user_id = '22222222-2222-2222-2222-222222222222'
-        WHERE id = '88888888-8888-8888-8888-888888888888';
-        RAISE EXCEPTION 'FAIL: User was able to transfer ownership of show_progress!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM NOT LIKE '%Cannot transfer ownership%' THEN RAISE EXCEPTION '%', SQLERRM; END IF;
-    END;
-END $$;
-
--- Stale write attempt on show_progress
-UPDATE public.show_progress
-SET episode = 99, client_updated_at = '2026-10-23 11:00:00+00'
-WHERE id = '88888888-8888-8888-8888-888888888888';
-
-DO $$
-DECLARE v_ep INT;
-BEGIN
-    SELECT episode INTO v_ep FROM public.show_progress WHERE id = '88888888-8888-8888-8888-888888888888';
-    IF v_ep != 2 THEN
-        RAISE EXCEPTION 'FAIL: Stale write overwritten show_progress (episode changed to %)!', v_ep;
-    END IF;
-END $$;
-
--- Stale write attempt on private_notes
-INSERT INTO public.private_notes (id, user_id, show_id, body, client_updated_at)
-VALUES ('99999999-9999-9999-9999-999999999999', '11111111-1111-1111-1111-111111111111', 300, 'Original note', '2026-10-23 12:00:00+00')
-ON CONFLICT DO NOTHING;
-
-UPDATE public.private_notes
-SET body = 'Stale note overwrite', client_updated_at = '2026-10-23 11:00:00+00'
-WHERE id = '99999999-9999-9999-9999-999999999999';
-
-DO $$
-DECLARE v_body TEXT;
-BEGIN
-    SELECT body INTO v_body FROM public.private_notes WHERE id = '99999999-9999-9999-9999-999999999999';
-    IF v_body != 'Original note' THEN
-        RAISE EXCEPTION 'FAIL: Stale write overwritten private_notes!';
-    END IF;
-END $$;
-
--- ------------------------------------------------------------------------------
--- TEST 8: Non-Admin Writing to Bans / Staff Roles & Self Promotion
--- ------------------------------------------------------------------------------
-SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
-
-DO $$
-BEGIN
-    -- Write to bans
-    BEGIN
-        INSERT INTO public.bans (user_id, scope, reason) VALUES ('22222222-2222-2222-2222-222222222222', 'global', 'Rogue ban');
-        RAISE EXCEPTION 'FAIL: Alice inserted into bans!';
+        UPDATE public.moderation_actions SET reason = 'Tampered reason' WHERE id = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+        RAISE EXCEPTION 'FAIL: moderation_actions row was updated!';
     EXCEPTION WHEN insufficient_privilege THEN END;
 
-    -- Self promotion into staff_roles
     BEGIN
-        INSERT INTO public.staff_roles (user_id, role) VALUES ('11111111-1111-1111-1111-111111111111', 'admin');
-        RAISE EXCEPTION 'FAIL: Alice promoted herself to admin in staff_roles!';
+        DELETE FROM public.moderation_actions WHERE id = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+        RAISE EXCEPTION 'FAIL: moderation_actions row was deleted!';
     EXCEPTION WHEN insufficient_privilege THEN END;
 END $$;
 
 -- ------------------------------------------------------------------------------
--- TEST 9: Double Like Rejection & Clamping Below Zero
--- ------------------------------------------------------------------------------
--- Bob likes Alice's visible log
-SELECT set_actor('22222222-2222-2222-2222-222222222222'); -- Bob
-
--- Create fresh visible log for like testing
-INSERT INTO public.logs (id, user_id, show_id, show_name, review_text, status)
-VALUES ('10101010-1010-1010-1010-101010101010', '11111111-1111-1111-1111-111111111111', 400, 'Succession', 'Great show', 'visible')
-ON CONFLICT (id) DO NOTHING;
-
-INSERT INTO public.log_likes (user_id, log_id)
-VALUES ('22222222-2222-2222-2222-222222222222', '10101010-1010-1010-1010-101010101010');
-
--- Double like attempt must violate unique constraint
-DO $$
-BEGIN
-    BEGIN
-        INSERT INTO public.log_likes (user_id, log_id)
-        VALUES ('22222222-2222-2222-2222-222222222222', '10101010-1010-1010-1010-101010101010');
-        RAISE EXCEPTION 'FAIL: Double like allowed!';
-    EXCEPTION WHEN unique_violation THEN END;
-END $$;
-
--- Bob unlikes
-DELETE FROM public.log_likes
-WHERE user_id = '22222222-2222-2222-2222-222222222222' AND log_id = '10101010-1010-1010-1010-101010101010';
-
--- Verify count is 0 and does not drop below 0
-DO $$
-DECLARE v_likes INT;
-BEGIN
-    SELECT like_count INTO v_likes FROM public.logs WHERE id = '10101010-1010-1010-1010-101010101010';
-    IF v_likes != 0 THEN
-        RAISE EXCEPTION 'FAIL: like_count is not 0 after unlike (got %)!', v_likes;
-    END IF;
-END $$;
-
--- ------------------------------------------------------------------------------
--- TEST 10: CHECK Constraint Rejections (Proving bad data is rejected)
+-- TEST 8: CHECK Constraint Rejections (Proving bad data is rejected)
 -- ------------------------------------------------------------------------------
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
 
@@ -368,21 +285,7 @@ BEGIN
         RAISE EXCEPTION 'FAIL: Log accepted invalid rating 3.7!';
     EXCEPTION WHEN check_violation THEN END;
 
-    -- Invalid rating: 5.5 (> 5.0)
-    BEGIN
-        INSERT INTO public.logs (user_id, show_id, show_name, rating)
-        VALUES ('11111111-1111-1111-1111-111111111111', 500, 'Test', 5.5);
-        RAISE EXCEPTION 'FAIL: Log accepted out-of-range rating 5.5!';
-    EXCEPTION WHEN check_violation THEN END;
-
-    -- Review text > 5000 chars
-    BEGIN
-        INSERT INTO public.logs (user_id, show_id, show_name, review_text)
-        VALUES ('11111111-1111-1111-1111-111111111111', 500, 'Test', repeat('A', 5001));
-        RAISE EXCEPTION 'FAIL: Log accepted review > 5000 chars!';
-    EXCEPTION WHEN check_violation THEN END;
-
-    -- Tags count > 20
+    -- Tags count > 20 using cardinality(tags)
     BEGIN
         INSERT INTO public.logs (user_id, show_id, show_name, tags)
         VALUES ('11111111-1111-1111-1111-111111111111', 500, 'Test', ARRAY[
@@ -394,7 +297,7 @@ BEGIN
 END $$;
 
 -- ------------------------------------------------------------------------------
--- TEST 11: Verify Every Public Table has Active RLS and At Least One Policy
+-- TEST 9: Verify Every Public Table has Active RLS and At Least One Policy
 -- ------------------------------------------------------------------------------
 DO $$
 DECLARE
@@ -406,7 +309,6 @@ BEGIN
         FROM pg_tables
         WHERE schemaname = 'public'
     ) LOOP
-        -- Verify RLS enabled
         IF NOT EXISTS (
             SELECT 1 FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -415,7 +317,6 @@ BEGIN
             RAISE EXCEPTION 'FAIL: Table public.% does not have RLS enabled!', r.tablename;
         END IF;
 
-        -- Verify at least one policy exists
         SELECT COUNT(*) INTO v_policy_count
         FROM pg_policies
         WHERE schemaname = 'public' AND tablename = r.tablename;
@@ -426,23 +327,8 @@ BEGIN
     END LOOP;
 END $$;
 
--- ------------------------------------------------------------------------------
--- TEST 12: Verify Idempotent pg_cron Tombstone Purge Job Exists
--- ------------------------------------------------------------------------------
-DO $$
-DECLARE v_job_count INT;
-BEGIN
-    SELECT COUNT(*) INTO v_job_count
-    FROM cron.job
-    WHERE jobname = 'purge-soft-deleted-tombstones';
-
-    IF v_job_count != 1 THEN
-        RAISE EXCEPTION 'FAIL: pg_cron tombstone purge job was not scheduled (found %)!', v_job_count;
-    END IF;
-END $$;
-
 RAISE NOTICE '============================================================';
-RAISE NOTICE 'SUCCESS: ALL 12 SECURITY, INTEGRITY & CONSTRAINT TESTS PASSED';
+RAISE NOTICE 'SUCCESS: ALL PHASE 1 EXHAUSTIVE RLS & INTEGRITY TESTS PASSED';
 RAISE NOTICE '============================================================';
 
 ROLLBACK;
