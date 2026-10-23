@@ -92,6 +92,7 @@ END $$;
 -- ------------------------------------------------------------------------------
 -- TEST 1-5: Anonymous Access Lockdown (pgTAP is())
 -- ------------------------------------------------------------------------------
+RESET ROLE;
 SELECT set_actor(NULL);
 
 SELECT is(count(*)::int, 0, 'Anon cannot read user_flags') FROM public.user_flags;
@@ -103,6 +104,7 @@ SELECT is(count(*)::int, 0, 'Anon cannot read moderation_actions') FROM public.m
 -- ------------------------------------------------------------------------------
 -- TEST 6-7: Anti-Probing Defense in private.is_banned() (lives_ok & throws_ok)
 -- ------------------------------------------------------------------------------
+RESET ROLE;
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice (non-admin)
 
 SELECT lives_ok(
@@ -120,6 +122,7 @@ SELECT throws_ok(
 -- ------------------------------------------------------------------------------
 -- TEST 8: Community Ban Does NOT Block Global Writes (lives_ok)
 -- ------------------------------------------------------------------------------
+RESET ROLE;
 SELECT set_actor('66666666-6666-6666-6666-666666666666'); -- Frank (community ban only)
 
 SELECT lives_ok(
@@ -130,6 +133,7 @@ SELECT lives_ok(
 -- ------------------------------------------------------------------------------
 -- TEST 9-11: Global Ban Rejections (throws_ok)
 -- ------------------------------------------------------------------------------
+RESET ROLE;
 SELECT set_actor('44444444-4444-4444-4444-444444444444'); -- Dave (globally banned)
 
 SELECT throws_ok(
@@ -156,13 +160,16 @@ SELECT throws_ok(
 -- ------------------------------------------------------------------------------
 -- TEST 12-13: Mutual Follow Deletion on Block (is())
 -- ------------------------------------------------------------------------------
+RESET ROLE;
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice follows Bob
 INSERT INTO public.follows (follower_id, followee_id) VALUES ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222') ON CONFLICT DO NOTHING;
 
+RESET ROLE;
 SELECT set_actor('22222222-2222-2222-2222-222222222222'); -- Bob follows Alice
 INSERT INTO public.follows (follower_id, followee_id) VALUES ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111') ON CONFLICT DO NOTHING;
 
 -- Alice blocks Bob
+RESET ROLE;
 SELECT set_actor('11111111-1111-1111-1111-111111111111');
 INSERT INTO public.blocks (blocker_id, blocked_id) VALUES ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222') ON CONFLICT DO NOTHING;
 
@@ -174,6 +181,7 @@ SELECT is(
 WHERE (follower_id = '11111111-1111-1111-1111-111111111111' AND followee_id = '22222222-2222-2222-2222-222222222222')
    OR (follower_id = '22222222-2222-2222-2222-222222222222' AND followee_id = '11111111-1111-1111-1111-111111111111');
 
+RESET ROLE;
 SELECT set_actor('11111111-1111-1111-1111-111111111111');
 DELETE FROM public.blocks WHERE blocker_id = '11111111-1111-1111-1111-111111111111' AND blocked_id = '22222222-2222-2222-2222-222222222222';
 
@@ -193,6 +201,7 @@ INSERT INTO public.logs (id, user_id, show_id, show_name, review_text, status)
 VALUES ('77777777-7777-7777-7777-777777777777', '11111111-1111-1111-1111-111111111111', 200, 'The Wire', 'Classic', 'visible')
 ON CONFLICT (id) DO UPDATE SET review_text = 'Classic';
 
+RESET ROLE;
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
 SELECT throws_ok(
     $$ UPDATE public.logs SET status = 'hidden' WHERE id = '77777777-7777-7777-7777-777777777777' $$,
@@ -204,6 +213,7 @@ SELECT throws_ok(
 RESET ROLE;
 UPDATE public.logs SET status = 'removed' WHERE id = '77777777-7777-7777-7777-777777777777';
 
+RESET ROLE;
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice attempts un-remove
 SELECT throws_ok(
     $$ UPDATE public.logs SET status = 'visible' WHERE id = '77777777-7777-7777-7777-777777777777' $$,
@@ -215,6 +225,7 @@ SELECT throws_ok(
 -- ------------------------------------------------------------------------------
 -- TEST 16-19: Append-Only Moderation Actions (throws_ok & lives_ok)
 -- ------------------------------------------------------------------------------
+RESET ROLE;
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
 SELECT throws_ok(
     $$ INSERT INTO public.moderation_actions (actor_id, action, target_type, target_id, reason) VALUES ('11111111-1111-1111-1111-111111111111', 'ban', 'user', '22222222-2222-2222-2222-222222222222', 'Rogue') $$,
@@ -223,6 +234,7 @@ SELECT throws_ok(
     'Normal user cannot insert into moderation_actions'
 );
 
+RESET ROLE;
 SELECT set_actor('55555555-5555-5555-5555-555555555555'); -- Admin
 SELECT lives_ok(
     $$ INSERT INTO public.moderation_actions (id, actor_id, action, target_type, target_id, reason) VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', '55555555-5555-5555-5555-555555555555', 'ban', 'user', '44444444-4444-4444-4444-444444444444', 'Audit ban') $$,
