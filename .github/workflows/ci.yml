@@ -20,10 +20,10 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
 
     steps:
       - name: Check out repository
@@ -34,7 +34,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client
 
-      - name: Setup Mock Supabase Schema & Auth System
+      - name: Setup Mock Supabase Auth & pg_cron Environment
         run: |
           PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -f supabase/tests/00_setup_auth_mock.sql
 
@@ -42,13 +42,18 @@ jobs:
         run: |
           for file in $(ls -1 supabase/migrations/*.sql | sort); do
             echo "Applying migration: $file"
-            PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -f "$file"
+            PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -f "$file"
           done
 
-      - name: Execute Phase 1 RLS Test Suite
+      - name: Execute Phase 1 Comprehensive RLS & Security Test Suite
         run: |
-          echo "Running RLS Policy Matrix Tests..."
+          echo "============================================================"
+          echo "Executing Phase 1 RLS, Escalation & Constraint Test Matrix..."
+          echo "============================================================"
           PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -f supabase/tests/01_phase1_rls_test.sql
+          echo "============================================================"
+          echo "TEST EXECUTION FINISHED SUCCESSFULLY!"
+          echo "============================================================"
 
   code-lint-and-format:
     runs-on: ubuntu-24.04
@@ -61,14 +66,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Lint Worker (Ruff & Flake8)
+      - name: Run Static SQL Linter
+        run: |
+          python supabase/tests/run_local_lint.py
+
+      - name: Lint Python Scripts
         run: |
           pip install flake8
-          flake8 worker/ --max-line-length=100 --exclude=__pycache__ || true
+          flake8 scripts/ supabase/tests/ --max-line-length=120 --ignore=E501,E402,W503 || true
 
-      - name: Validate Edge Function syntax
-        uses: denoland/setup-deno@v1
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
         with:
           deno-version: v1.x
-      - run: |
-          deno check supabase/functions/*/*.ts || true
+
+      - name: Check Edge Functions syntax
+        run: |
+          deno check supabase/functions/check-username/index.ts
+          deno check supabase/functions/delete-account/index.ts
