@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- Migration: 20261023000001_phase1_initial_schema.sql
--- Description: Phase 1 Foundation - Comprehensive Security Hardened Schema
+-- Description: Phase 1 Foundation - Comprehensive Production-Hardened Engine
 -- ==============================================================================
 
 -- 1. SCHEMAS & EXTENSIONS
@@ -70,16 +70,17 @@ CREATE TABLE IF NOT EXISTS public.user_flags (
     updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
 );
 
--- 5. BANS (Minimal Table for Safety)
+-- 5. BANS
 CREATE TABLE IF NOT EXISTS public.bans (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
     scope ban_scope DEFAULT 'global' NOT NULL,
     community_id UUID,
-    reason TEXT,
+    reason TEXT NOT NULL,
     banned_by UUID,
     expires_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    CONSTRAINT ban_reason_length CHECK (length(trim(reason)) >= 3)
 );
 
 CREATE INDEX IF NOT EXISTS idx_bans_user_scope ON public.bans(user_id, scope, expires_at);
@@ -96,7 +97,23 @@ CREATE TABLE IF NOT EXISTS public.staff_roles (
 
 CREATE INDEX IF NOT EXISTS idx_staff_roles_lookup ON public.staff_roles(user_id, role);
 
--- 7. SOCIAL RELATIONSHIPS: FOLLOWS & BLOCKS
+-- 7. APPEND-ONLY MODERATION AUDIT LOG
+CREATE TABLE IF NOT EXISTS public.moderation_actions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor_id UUID REFERENCES public.profiles(id),
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id UUID NOT NULL,
+    reason TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    CONSTRAINT moderation_action_reason_check CHECK (length(trim(reason)) >= 3)
+);
+
+CREATE INDEX IF NOT EXISTS idx_moderation_actions_target ON public.moderation_actions(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_moderation_actions_created ON public.moderation_actions(created_at DESC);
+
+-- 8. SOCIAL RELATIONSHIPS: FOLLOWS & BLOCKS
 CREATE TABLE IF NOT EXISTS public.follows (
     follower_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
     followee_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
@@ -117,7 +134,7 @@ CREATE TABLE IF NOT EXISTS public.blocks (
 
 CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON public.blocks(blocked_id);
 
--- 8. TRACKING: LIBRARY ITEMS & SHOW PROGRESS (Sync & Soft Deletes)
+-- 9. TRACKING: LIBRARY ITEMS & SHOW PROGRESS (Sync & Soft Deletes)
 CREATE TABLE IF NOT EXISTS public.library_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
@@ -148,7 +165,7 @@ CREATE TABLE IF NOT EXISTS public.show_progress (
 
 CREATE INDEX IF NOT EXISTS idx_show_progress_sync ON public.show_progress(user_id, updated_at DESC, id);
 
--- 9. TRACKING: LOGS & DIARY
+-- 10. TRACKING: LOGS & DIARY
 CREATE TABLE IF NOT EXISTS public.logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
@@ -176,14 +193,14 @@ CREATE TABLE IF NOT EXISTS public.logs (
         review_text IS NULL OR length(review_text) <= 5000
     ),
     CONSTRAINT tags_count_limit CHECK (
-        array_length(tags, 1) IS NULL OR array_length(tags, 1) <= 20
+        cardinality(tags) <= 20
     )
 );
 
 CREATE INDEX IF NOT EXISTS idx_logs_feed ON public.logs(status, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_logs_user_sync ON public.logs(user_id, updated_at DESC, id);
 
--- 10. LOG LIKES
+-- 11. LOG LIKES
 CREATE TABLE IF NOT EXISTS public.log_likes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
@@ -194,7 +211,7 @@ CREATE TABLE IF NOT EXISTS public.log_likes (
 
 CREATE INDEX IF NOT EXISTS idx_log_likes_log ON public.log_likes(log_id);
 
--- 11. PRIVATE OWNER-ONLY NOTES
+-- 12. PRIVATE OWNER-ONLY NOTES
 CREATE TABLE IF NOT EXISTS public.private_notes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE NOT NULL,
@@ -211,7 +228,7 @@ CREATE TABLE IF NOT EXISTS public.private_notes (
 CREATE INDEX IF NOT EXISTS idx_private_notes_sync ON public.private_notes(user_id, updated_at DESC, id);
 
 -- ==============================================================================
--- 12. SECURITY FUNCTIONS IN PRIVATE SCHEMA (Isolated from Public RPC Exposure)
+-- 13. SECURITY FUNCTIONS IN PRIVATE SCHEMA
 -- ==============================================================================
 
 CREATE OR REPLACE FUNCTION private.is_admin()
@@ -227,7 +244,7 @@ AS $$
     );
 $$;
 
--- Global ban checker with anti-probing defense
+-- Global ban checker with strict IS DISTINCT FROM probing defense
 CREATE OR REPLACE FUNCTION private.is_banned(target_user_id UUID DEFAULT auth.uid())
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -236,8 +253,8 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-    -- Anti-probing defense: Non-admins can strictly check their own status only
-    IF target_user_id != auth.uid() AND NOT private.is_admin() THEN
+    -- Anti-probing defense using IS DISTINCT FROM
+    IF target_user_id IS DISTINCT FROM auth.uid() AND NOT private.is_admin() THEN
         RAISE EXCEPTION 'Access denied: Cannot probe ban status of other users';
     END IF;
 
@@ -252,7 +269,7 @@ END;
 $$;
 
 -- ==============================================================================
--- 13. PUBLIC SECURITY DEFINER UTILITIES
+-- 14. PUBLIC SECURITY DEFINER UTILITIES
 -- ==============================================================================
 
 CREATE OR REPLACE FUNCTION public.is_blocked_between(user_a UUID, user_b UUID)
@@ -269,7 +286,6 @@ AS $$
     );
 $$;
 
--- Allows a blocker to retrieve their blocked user list for unblocking
 CREATE OR REPLACE FUNCTION public.get_my_blocked_users()
 RETURNS TABLE (
     blocked_id UUID,
@@ -293,7 +309,6 @@ AS $$
     ORDER BY b.created_at DESC;
 $$;
 
--- Maintenance like count recalculation
 CREATE OR REPLACE FUNCTION public.recount_likes(target_log_id UUID)
 RETURNS VOID
 LANGUAGE plpgsql
@@ -317,7 +332,6 @@ BEGIN
 END;
 $$;
 
--- Scheduled 90-Day Tombstone Purge
 CREATE OR REPLACE FUNCTION public.purge_soft_deleted_tombstones(retention_days INT DEFAULT 90)
 RETURNS INT
 LANGUAGE plpgsql
@@ -350,10 +364,9 @@ END;
 $$;
 
 -- ==============================================================================
--- 14. AUTOMATIC TRIGGERS & INTEGRITY GUARDS
+-- 15. AUTOMATIC TRIGGERS & INTEGRITY GUARDS
 -- ==============================================================================
 
--- Timestamp updater
 CREATE OR REPLACE FUNCTION public.fn_set_updated_at()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -430,17 +443,14 @@ AS $$
 DECLARE
     v_max_future TIMESTAMPTZ := NOW() + INTERVAL '5 minutes';
 BEGIN
-    -- Prevent user_id transfer / tampering
     IF TG_OP = 'UPDATE' AND NEW.user_id != OLD.user_id THEN
         RAISE EXCEPTION 'Access denied: Cannot transfer ownership of records';
     END IF;
 
-    -- Clamp client_updated_at to server now + 5 min tolerance
     IF NEW.client_updated_at > v_max_future THEN
         NEW.client_updated_at := v_max_future;
     END IF;
 
-    -- Stale write rejection: retain OLD state if client update is older
     IF TG_OP = 'UPDATE' THEN
         IF NEW.client_updated_at < OLD.client_updated_at THEN
             RETURN OLD;
@@ -476,12 +486,10 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-    -- User ID ownership lock
     IF TG_OP = 'UPDATE' AND NEW.user_id != OLD.user_id THEN
         RAISE EXCEPTION 'Access denied: Cannot transfer log ownership';
     END IF;
 
-    -- INSERT RULES:
     IF TG_OP = 'INSERT' THEN
         IF NEW.like_count != 0 AND NOT private.is_admin() THEN
             NEW.like_count := 0;
@@ -490,21 +498,16 @@ BEGIN
             NEW.status := 'visible';
         END IF;
 
-    -- UPDATE RULES:
     ELSIF TG_OP = 'UPDATE' THEN
-        -- Like count cannot be directly edited by client
         IF NEW.like_count != OLD.like_count AND NOT private.is_admin() THEN
             RAISE EXCEPTION 'Access denied: like_count is server-maintained and cannot be edited';
         END IF;
 
         IF NOT private.is_admin() THEN
-            -- Un-remove attack prevention & removed row freeze:
             IF OLD.status = 'removed' THEN
                 RAISE EXCEPTION 'Access denied: Content has been removed by moderation';
             END IF;
 
-            -- Client cannot change status (must soft-delete via deleted_at)
-            -- Blocks removed->visible, visible->hidden, visible->held, etc.
             IF NEW.status != OLD.status THEN
                 RAISE EXCEPTION 'Access denied: Cannot alter moderation status';
             END IF;
@@ -545,12 +548,18 @@ CREATE TRIGGER trg_update_log_like_count AFTER INSERT OR DELETE ON public.log_li
 FOR EACH ROW EXECUTE FUNCTION public.update_log_like_count();
 
 -- ==============================================================================
--- 15. PRIVILEGE AUDIT & RESTRICTIONS
+-- 16. PRIVILEGE AUDIT & DEFAULT PRIVILEGE REVOCATIONS
 -- ==============================================================================
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA private FROM PUBLIC, anon, authenticated;
+
+-- Default Privilege Hardening for all future objects
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM PUBLIC, anon;
+ALTER DEFAULT PRIVILEGES IN SCHEMA private REVOKE ALL ON TABLES FROM PUBLIC, anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA private REVOKE ALL ON FUNCTIONS FROM PUBLIC, anon, authenticated;
 
 -- Selective Table Grants
 GRANT SELECT ON public.profiles TO anon;
@@ -561,6 +570,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 REVOKE INSERT, UPDATE, DELETE ON public.user_flags FROM authenticated;
 REVOKE INSERT, UPDATE, DELETE ON public.bans FROM authenticated;
 REVOKE INSERT, UPDATE, DELETE ON public.staff_roles FROM authenticated;
+REVOKE INSERT, UPDATE, DELETE ON public.moderation_actions FROM authenticated;
 
 -- Selective Function Grants
 GRANT EXECUTE ON FUNCTION public.get_my_blocked_users TO authenticated;
@@ -568,13 +578,14 @@ GRANT EXECUTE ON FUNCTION private.is_banned TO authenticated;
 GRANT EXECUTE ON FUNCTION private.is_admin TO authenticated;
 
 -- ==============================================================================
--- 16. ROW LEVEL SECURITY (RLS) POLICIES
+-- 17. ROW LEVEL SECURITY (RLS) POLICIES
 -- ==============================================================================
 
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_flags ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.bans ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.staff_roles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.moderation_actions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.follows ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.blocks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.library_items ENABLE ROW LEVEL SECURITY;
@@ -628,6 +639,19 @@ CREATE POLICY "staff_roles_admin_manage" ON public.staff_roles
 FOR ALL USING (
     private.is_admin()
 ) WITH CHECK (
+    private.is_admin()
+);
+
+-- MODERATION ACTIONS (Append-only audit log: Insert-only, No update or delete policies):
+DROP POLICY IF EXISTS "moderation_actions_admin_select" ON public.moderation_actions;
+CREATE POLICY "moderation_actions_admin_select" ON public.moderation_actions
+FOR SELECT USING (
+    private.is_admin()
+);
+
+DROP POLICY IF EXISTS "moderation_actions_admin_insert" ON public.moderation_actions;
+CREATE POLICY "moderation_actions_admin_insert" ON public.moderation_actions
+FOR INSERT WITH CHECK (
     private.is_admin()
 );
 
@@ -802,20 +826,3 @@ CREATE POLICY "log_likes_delete_own" ON public.log_likes
 FOR DELETE USING (
     auth.uid() = user_id
 );
-
--- ==============================================================================
--- 17. IDEMPOTENT PG_CRON SCHEDULE (90-Day Retention)
--- ==============================================================================
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'cron') THEN
-        PERFORM cron.unschedule('purge-soft-deleted-tombstones')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'purge-soft-deleted-tombstones');
-
-        PERFORM cron.schedule(
-            'purge-soft-deleted-tombstones',
-            '0 3 * * *',
-            'SELECT public.purge_soft_deleted_tombstones(90);'
-        );
-    END IF;
-END $$;
