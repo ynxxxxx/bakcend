@@ -1,0 +1,74 @@
+name: Backend CI & Security Validation
+
+on:
+  push:
+    branches: [ main, 'phase-*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  db-migrations-and-rls-tests:
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Setup Mock Supabase Schema & Auth System
+        run: |
+          PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -f supabase/tests/00_setup_auth_mock.sql
+
+      - name: Run SQL Migrations
+        run: |
+          for file in $(ls -1 supabase/migrations/*.sql | sort); do
+            echo "Applying migration: $file"
+            PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -f "$file"
+          done
+
+      - name: Execute Phase 1 RLS Test Suite
+        run: |
+          echo "Running RLS Policy Matrix Tests..."
+          PGPASSWORD=postgrespassword psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -f supabase/tests/01_phase1_rls_test.sql
+
+  code-lint-and-format:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Lint Worker (Ruff & Flake8)
+        run: |
+          pip install flake8
+          flake8 worker/ --max-line-length=100 --exclude=__pycache__ || true
+
+      - name: Validate Edge Function syntax
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+      - run: |
+          deno check supabase/functions/*/*.ts || true

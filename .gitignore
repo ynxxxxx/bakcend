@@ -1,0 +1,59 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.cert
+*.pfx
+secrets/
+
+# Database & Docker local state
+volumes/
+supabase/.temp/
+postgres-data/
+redis-data/
+
+# Python / FastAPI Worker
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Deno / Edge Functions
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.deno/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
