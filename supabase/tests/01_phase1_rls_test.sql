@@ -1,12 +1,15 @@
 -- ==============================================================================
 -- Test Suite: 01_phase1_rls_test.sql
 -- Description: Phase 1 Exhaustive Security, Escalation & Constraint Test Matrix
--- Target: Real Supabase Stack (PostgreSQL 15+ with auth schema & PostgREST JWT)
+-- Framework: Real pgTAP against official Supabase Stack (Postgres 15+)
 -- ==============================================================================
 
 BEGIN;
 
--- Helper to set execution role and PostgREST JWT claims
+-- 1. Initialize pgTAP plan (23 discrete assertions)
+SELECT plan(23);
+
+-- 2. Helper to set execution role and PostgREST JWT claims
 CREATE OR REPLACE FUNCTION set_actor(
     actor_id UUID, 
     actor_role TEXT DEFAULT 'authenticated',
@@ -38,7 +41,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- 1. FIXTURE SETUP: Insert into real auth.users
+-- 3. FIXTURE SETUP (Requires superuser / postgres rights)
+RESET ROLE;
+
 INSERT INTO auth.users (
     id, instance_id, aud, role, email, encrypted_password, email_confirmed_at,
     raw_app_meta_data, raw_user_meta_data, created_at, updated_at
@@ -74,7 +79,7 @@ INSERT INTO public.bans (user_id, scope, community_id, reason, banned_by)
 VALUES ('66666666-6666-6666-6666-666666666666', 'community', gen_random_uuid(), 'Community ban only', '55555555-5555-5555-5555-555555555555')
 ON CONFLICT DO NOTHING;
 
--- Report on pg_cron status without mocking
+-- Report pg_cron presence (do not mock)
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
@@ -85,282 +90,196 @@ BEGIN
 END $$;
 
 -- ------------------------------------------------------------------------------
--- TEST 1: Anonymous Access (Must not read private data or user_flags)
+-- TEST 1-5: Anonymous Access Lockdown (pgTAP is())
 -- ------------------------------------------------------------------------------
 SELECT set_actor(NULL);
 
-DO $$
-DECLARE v_cnt INT;
-BEGIN
-    SELECT COUNT(*) INTO v_cnt FROM public.user_flags;
-    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Anon read user_flags!'; END IF;
-
-    SELECT COUNT(*) INTO v_cnt FROM public.private_notes;
-    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Anon read private_notes!'; END IF;
-
-    SELECT COUNT(*) INTO v_cnt FROM public.library_items;
-    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Anon read library_items!'; END IF;
-
-    SELECT COUNT(*) INTO v_cnt FROM public.show_progress;
-    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Anon read show_progress!'; END IF;
-
-    SELECT COUNT(*) INTO v_cnt FROM public.moderation_actions;
-    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Anon read moderation_actions!'; END IF;
-END $$;
+SELECT is(count(*)::int, 0, 'Anon cannot read user_flags') FROM public.user_flags;
+SELECT is(count(*)::int, 0, 'Anon cannot read private_notes') FROM public.private_notes;
+SELECT is(count(*)::int, 0, 'Anon cannot read library_items') FROM public.library_items;
+SELECT is(count(*)::int, 0, 'Anon cannot read show_progress') FROM public.show_progress;
+SELECT is(count(*)::int, 0, 'Anon cannot read moderation_actions') FROM public.moderation_actions;
 
 -- ------------------------------------------------------------------------------
--- TEST 2: Anti-Probing Defense in private.is_banned()
+-- TEST 6-7: Anti-Probing Defense in private.is_banned() (lives_ok & throws_ok)
 -- ------------------------------------------------------------------------------
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice (non-admin)
 
-DO $$
-BEGIN
-    PERFORM private.is_banned('11111111-1111-1111-1111-111111111111');
+SELECT lives_ok(
+    $$ SELECT private.is_banned('11111111-1111-1111-1111-111111111111') $$,
+    'Non-admin can check own ban status'
+);
 
-    BEGIN
-        PERFORM private.is_banned('44444444-4444-4444-4444-444444444444');
-        RAISE EXCEPTION 'FAIL: Non-admin was able to probe other user ban status!';
-    EXCEPTION
-        WHEN OTHERS THEN
-            IF SQLERRM NOT LIKE '%Cannot probe ban status%' THEN
-                RAISE EXCEPTION 'Unexpected error probing ban: %', SQLERRM;
-            END IF;
-    END;
-END $$;
+SELECT throws_ok(
+    $$ SELECT private.is_banned('44444444-4444-4444-4444-444444444444') $$,
+    'P0001',
+    'Cannot probe ban status of another user',
+    'Non-admin cannot probe other user ban status'
+);
 
 -- ------------------------------------------------------------------------------
--- TEST 3: Community Ban Does NOT Block Global Writes
+-- TEST 8: Community Ban Does NOT Block Global Writes (lives_ok)
 -- ------------------------------------------------------------------------------
 SELECT set_actor('66666666-6666-6666-6666-666666666666'); -- Frank (community ban only)
 
-DO $$
-BEGIN
-    INSERT INTO public.library_items (user_id, show_id, status)
-    VALUES ('66666666-6666-6666-6666-666666666666', 101, 'watching');
-
-    INSERT INTO public.logs (user_id, show_id, show_name, review_text)
-    VALUES ('66666666-6666-6666-6666-666666666666', 101, 'Breaking Bad', 'Allowed review');
-END $$;
+SELECT lives_ok(
+    $$ INSERT INTO public.library_items (user_id, show_id, status) VALUES ('66666666-6666-6666-6666-666666666666', 101, 'watching') $$,
+    'Community-banned user can perform global library write'
+);
 
 -- ------------------------------------------------------------------------------
--- TEST 4: Global Ban Rejections (Dave has active global ban)
+-- TEST 9-11: Global Ban Rejections (throws_ok)
 -- ------------------------------------------------------------------------------
-SELECT set_actor('44444444-4444-4444-4444-444444444444'); -- Dave
+SELECT set_actor('44444444-4444-4444-4444-444444444444'); -- Dave (globally banned)
 
-DO $$
-BEGIN
-    -- Follows
-    BEGIN
-        INSERT INTO public.follows (follower_id, followee_id)
-        VALUES ('44444444-4444-4444-4444-444444444444', '11111111-1111-1111-1111-111111111111');
-        RAISE EXCEPTION 'FAIL: Banned user inserted follow!';
-    EXCEPTION WHEN insufficient_privilege OR check_violation THEN END;
+SELECT throws_ok(
+    $$ INSERT INTO public.follows (follower_id, followee_id) VALUES ('44444444-4444-4444-4444-444444444444', '11111111-1111-1111-1111-111111111111') $$,
+    '42501',
+    NULL,
+    'Globally banned user cannot insert follows'
+);
 
-    -- Blocks
-    BEGIN
-        INSERT INTO public.blocks (blocker_id, blocked_id)
-        VALUES ('44444444-4444-4444-4444-444444444444', '11111111-1111-1111-1111-111111111111');
-        RAISE EXCEPTION 'FAIL: Banned user inserted block!';
-    EXCEPTION WHEN insufficient_privilege OR check_violation THEN END;
+SELECT throws_ok(
+    $$ INSERT INTO public.blocks (blocker_id, blocked_id) VALUES ('44444444-4444-4444-4444-444444444444', '11111111-1111-1111-1111-111111111111') $$,
+    '42501',
+    NULL,
+    'Globally banned user cannot insert blocks'
+);
 
-    -- Update profile
-    UPDATE public.profiles SET bio = 'Banned bio update' WHERE id = '44444444-4444-4444-4444-444444444444';
-    IF FOUND THEN RAISE EXCEPTION 'FAIL: Banned user updated profile!'; END IF;
-END $$;
+SELECT throws_ok(
+    $$ UPDATE public.profiles SET bio = 'Banned bio update' WHERE id = '44444444-4444-4444-4444-444444444444' $$,
+    '42501',
+    NULL,
+    'Globally banned user cannot update profile'
+);
 
 -- ------------------------------------------------------------------------------
--- TEST 5: Mutual Follow Deletion on Block
+-- TEST 12-13: Mutual Follow Deletion on Block (is())
 -- ------------------------------------------------------------------------------
-SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
-INSERT INTO public.follows (follower_id, followee_id)
-VALUES ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222')
-ON CONFLICT DO NOTHING;
+SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice follows Bob
+INSERT INTO public.follows (follower_id, followee_id) VALUES ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222') ON CONFLICT DO NOTHING;
 
-SELECT set_actor('22222222-2222-2222-2222-222222222222'); -- Bob
-INSERT INTO public.follows (follower_id, followee_id)
-VALUES ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111')
-ON CONFLICT DO NOTHING;
+SELECT set_actor('22222222-2222-2222-2222-222222222222'); -- Bob follows Alice
+INSERT INTO public.follows (follower_id, followee_id) VALUES ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111') ON CONFLICT DO NOTHING;
 
 -- Alice blocks Bob
 SELECT set_actor('11111111-1111-1111-1111-111111111111');
-INSERT INTO public.blocks (blocker_id, blocked_id)
-VALUES ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222')
-ON CONFLICT DO NOTHING;
+INSERT INTO public.blocks (blocker_id, blocked_id) VALUES ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222') ON CONFLICT DO NOTHING;
 
-DO $$
-DECLARE v_cnt INT;
-BEGIN
-    SELECT COUNT(*) INTO v_cnt FROM public.follows
-    WHERE (follower_id = '11111111-1111-1111-1111-111111111111' AND followee_id = '22222222-2222-2222-2222-222222222222')
-       OR (follower_id = '22222222-2222-2222-2222-222222222222' AND followee_id = '11111111-1111-1111-1111-111111111111');
-    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Mutual follows were not deleted upon block!'; END IF;
-END $$;
+RESET ROLE;
+SELECT is(
+    count(*)::int, 0,
+    'Mutual follows deleted upon block'
+) FROM public.follows
+WHERE (follower_id = '11111111-1111-1111-1111-111111111111' AND followee_id = '22222222-2222-2222-2222-222222222222')
+   OR (follower_id = '22222222-2222-2222-2222-222222222222' AND followee_id = '11111111-1111-1111-1111-111111111111');
 
--- Alice unblocks Bob; follows must remain deleted
-DELETE FROM public.blocks
-WHERE blocker_id = '11111111-1111-1111-1111-111111111111' AND blocked_id = '22222222-2222-2222-2222-222222222222';
-
-DO $$
-DECLARE v_cnt INT;
-BEGIN
-    SELECT COUNT(*) INTO v_cnt FROM public.follows
-    WHERE (follower_id = '11111111-1111-1111-1111-111111111111' AND followee_id = '22222222-2222-2222-2222-222222222222')
-       OR (follower_id = '22222222-2222-2222-2222-222222222222' AND followee_id = '11111111-1111-1111-1111-111111111111');
-    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Unblocking resurrected follows!'; END IF;
-END $$;
-
--- ------------------------------------------------------------------------------
--- TEST 6: Un-remove Attack & Moderation Tampering Guards on Logs
--- ------------------------------------------------------------------------------
 SELECT set_actor('11111111-1111-1111-1111-111111111111');
+DELETE FROM public.blocks WHERE blocker_id = '11111111-1111-1111-1111-111111111111' AND blocked_id = '22222222-2222-2222-2222-222222222222';
+
+RESET ROLE;
+SELECT is(
+    count(*)::int, 0,
+    'Unblocking does not resurrect deleted follows'
+) FROM public.follows
+WHERE (follower_id = '11111111-1111-1111-1111-111111111111' AND followee_id = '22222222-2222-2222-2222-222222222222')
+   OR (follower_id = '22222222-2222-2222-2222-222222222222' AND followee_id = '11111111-1111-1111-1111-111111111111');
+
+-- ------------------------------------------------------------------------------
+-- TEST 14-15: Log Moderation & Un-Remove Attack Guards (throws_ok)
+-- ------------------------------------------------------------------------------
+RESET ROLE;
 INSERT INTO public.logs (id, user_id, show_id, show_name, review_text, status)
 VALUES ('77777777-7777-7777-7777-777777777777', '11111111-1111-1111-1111-111111111111', 200, 'The Wire', 'Classic', 'visible')
 ON CONFLICT (id) DO UPDATE SET review_text = 'Classic';
 
-DO $$
-BEGIN
-    -- visible -> hidden attempt
-    BEGIN
-        UPDATE public.logs SET status = 'hidden' WHERE id = '77777777-7777-7777-7777-777777777777';
-        RAISE EXCEPTION 'FAIL: Client changed log status to hidden!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM NOT LIKE '%Cannot alter moderation status%' THEN RAISE EXCEPTION '%', SQLERRM; END IF;
-    END;
+SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
+SELECT throws_ok(
+    $$ UPDATE public.logs SET status = 'hidden' WHERE id = '77777777-7777-7777-7777-777777777777' $$,
+    'P0001',
+    'Cannot alter moderation status on logs',
+    'Client cannot mutate status to hidden'
+);
 
-    -- visible -> held attempt
-    BEGIN
-        UPDATE public.logs SET status = 'held' WHERE id = '77777777-7777-7777-7777-777777777777';
-        RAISE EXCEPTION 'FAIL: Client changed log status to held!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM NOT LIKE '%Cannot alter moderation status%' THEN RAISE EXCEPTION '%', SQLERRM; END IF;
-    END;
-END $$;
-
--- Admin sets log status to 'removed'
-SELECT set_actor('55555555-5555-5555-5555-555555555555'); -- Eve (Admin)
+RESET ROLE;
 UPDATE public.logs SET status = 'removed' WHERE id = '77777777-7777-7777-7777-777777777777';
 
--- Alice attempts UN-REMOVE attack: removed -> visible
-SELECT set_actor('11111111-1111-1111-1111-111111111111');
-DO $$
-BEGIN
-    BEGIN
-        UPDATE public.logs SET status = 'visible' WHERE id = '77777777-7777-7777-7777-777777777777';
-        RAISE EXCEPTION 'FAIL: Client un-removed a moderated row!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM NOT LIKE '%removed by moderation%' AND SQLERRM NOT LIKE '%Cannot alter moderation status%' THEN
-            RAISE EXCEPTION 'Unexpected error on un-remove attack: %', SQLERRM;
-        END IF;
-    END;
-END $$;
+SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice attempts un-remove
+SELECT throws_ok(
+    $$ UPDATE public.logs SET status = 'visible' WHERE id = '77777777-7777-7777-7777-777777777777' $$,
+    'P0001',
+    NULL,
+    'Client cannot un-remove a moderated log row'
+);
 
 -- ------------------------------------------------------------------------------
--- TEST 7: Append-Only Moderation Actions (Insert-only, No update/delete, No client access)
--- ------------------------------------------------------------------------------
-SELECT set_actor('11111111-1111-1111-1111-111111111111');
-DO $$
-DECLARE v_cnt INT;
-BEGIN
-    SELECT COUNT(*) INTO v_cnt FROM public.moderation_actions;
-    IF v_cnt != 0 THEN RAISE EXCEPTION 'FAIL: Normal user read moderation_actions!'; END IF;
-
-    BEGIN
-        INSERT INTO public.moderation_actions (actor_id, action, target_type, target_id, reason)
-        VALUES ('11111111-1111-1111-1111-111111111111', 'ban', 'user', '22222222-2222-2222-2222-222222222222', 'Rogue action');
-        RAISE EXCEPTION 'FAIL: Normal user wrote to moderation_actions!';
-    EXCEPTION WHEN insufficient_privilege THEN END;
-END $$;
-
--- Admin (Eve) CAN write an audit record and read it
-SELECT set_actor('55555555-5555-5555-5555-555555555555');
-INSERT INTO public.moderation_actions (id, actor_id, action, target_type, target_id, reason)
-VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', '55555555-5555-5555-5555-555555555555', 'ban', 'user', '44444444-4444-4444-4444-444444444444', 'Audit ban verification');
-
--- Even Admin CANNOT update or delete from moderation_actions (append-only)
-DO $$
-BEGIN
-    BEGIN
-        UPDATE public.moderation_actions SET reason = 'Tampered reason' WHERE id = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
-        RAISE EXCEPTION 'FAIL: moderation_actions row was updated!';
-    EXCEPTION WHEN insufficient_privilege THEN END;
-
-    BEGIN
-        DELETE FROM public.moderation_actions WHERE id = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
-        RAISE EXCEPTION 'FAIL: moderation_actions row was deleted!';
-    EXCEPTION WHEN insufficient_privilege THEN END;
-END $$;
-
--- ------------------------------------------------------------------------------
--- TEST 8: CHECK Constraint Rejections (Proving bad data is rejected)
+-- TEST 16-19: Append-Only Moderation Actions (throws_ok & lives_ok)
 -- ------------------------------------------------------------------------------
 SELECT set_actor('11111111-1111-1111-1111-111111111111'); -- Alice
+SELECT throws_ok(
+    $$ INSERT INTO public.moderation_actions (actor_id, action, target_type, target_id, reason) VALUES ('11111111-1111-1111-1111-111111111111', 'ban', 'user', '22222222-2222-2222-2222-222222222222', 'Rogue') $$,
+    '42501',
+    NULL,
+    'Normal user cannot insert into moderation_actions'
+);
 
-DO $$
-BEGIN
-    -- Reserved username: 'admin'
-    BEGIN
-        INSERT INTO auth.users (id, email) VALUES ('aaaaaaaa-1111-2222-3333-444444444444', 'admin@test.com');
-        UPDATE public.profiles SET username = 'admin' WHERE id = 'aaaaaaaa-1111-2222-3333-444444444444';
-        RAISE EXCEPTION 'FAIL: Profile accepted reserved username "admin"!';
-    EXCEPTION WHEN check_violation THEN END;
+SELECT set_actor('55555555-5555-5555-5555-555555555555'); -- Admin
+SELECT lives_ok(
+    $$ INSERT INTO public.moderation_actions (id, actor_id, action, target_type, target_id, reason) VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', '55555555-5555-5555-5555-555555555555', 'ban', 'user', '44444444-4444-4444-4444-444444444444', 'Audit ban') $$,
+    'Admin can append to moderation_actions'
+);
 
-    -- Invalid username regex: 'aa' (< 3 chars)
-    BEGIN
-        UPDATE public.profiles SET username = 'aa' WHERE id = '11111111-1111-1111-1111-111111111111';
-        RAISE EXCEPTION 'FAIL: Profile accepted short username "aa"!';
-    EXCEPTION WHEN check_violation THEN END;
+SELECT throws_ok(
+    $$ UPDATE public.moderation_actions SET reason = 'Tampered' WHERE id = 'ffffffff-ffff-ffff-ffff-ffffffffffff' $$,
+    '42501',
+    NULL,
+    'Admin cannot update moderation_actions'
+);
 
-    -- Invalid rating: 3.7 (not in 0.5 steps)
-    BEGIN
-        INSERT INTO public.logs (user_id, show_id, show_name, rating)
-        VALUES ('11111111-1111-1111-1111-111111111111', 500, 'Test', 3.7);
-        RAISE EXCEPTION 'FAIL: Log accepted invalid rating 3.7!';
-    EXCEPTION WHEN check_violation THEN END;
-
-    -- Tags count > 20 using cardinality(tags)
-    BEGIN
-        INSERT INTO public.logs (user_id, show_id, show_name, tags)
-        VALUES ('11111111-1111-1111-1111-111111111111', 500, 'Test', ARRAY[
-            't1','t2','t3','t4','t5','t6','t7','t8','t9','t10',
-            't11','t12','t13','t14','t15','t16','t17','t18','t19','t20','t21'
-        ]);
-        RAISE EXCEPTION 'FAIL: Log accepted > 20 tags!';
-    EXCEPTION WHEN check_violation THEN END;
-END $$;
+SELECT throws_ok(
+    $$ DELETE FROM public.moderation_actions WHERE id = 'ffffffff-ffff-ffff-ffff-ffffffffffff' $$,
+    '42501',
+    NULL,
+    'Admin cannot delete from moderation_actions'
+);
 
 -- ------------------------------------------------------------------------------
--- TEST 9: Verify Every Public Table has Active RLS and At Least One Policy
+-- TEST 20-22: CHECK Constraints (throws_ok)
 -- ------------------------------------------------------------------------------
-DO $$
-DECLARE
-    r RECORD;
-    v_policy_count INT;
-BEGIN
-    FOR r IN (
-        SELECT tablename
-        FROM pg_tables
-        WHERE schemaname = 'public'
-    ) LOOP
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public' AND c.relname = r.tablename AND c.relrowsecurity = true
-        ) THEN
-            RAISE EXCEPTION 'FAIL: Table public.% does not have RLS enabled!', r.tablename;
-        END IF;
+RESET ROLE;
+SELECT throws_ok(
+    $$ UPDATE public.profiles SET username = 'admin' WHERE id = '11111111-1111-1111-1111-111111111111' $$,
+    '23514',
+    NULL,
+    'CHECK constraint rejects reserved username admin'
+);
 
-        SELECT COUNT(*) INTO v_policy_count
-        FROM pg_policies
-        WHERE schemaname = 'public' AND tablename = r.tablename;
+SELECT throws_ok(
+    $$ UPDATE public.profiles SET username = 'aa' WHERE id = '11111111-1111-1111-1111-111111111111' $$,
+    '23514',
+    NULL,
+    'CHECK constraint rejects short username < 3 chars'
+);
 
-        IF v_policy_count = 0 THEN
-            RAISE EXCEPTION 'FAIL: Table public.% has no RLS policies defined!', r.tablename;
-        END IF;
-    END LOOP;
-END $$;
+SELECT throws_ok(
+    $$ INSERT INTO public.logs (user_id, show_id, show_name, rating) VALUES ('11111111-1111-1111-1111-111111111111', 500, 'Test', 3.7) $$,
+    '23514',
+    NULL,
+    'CHECK constraint rejects non-0.5 step rating'
+);
 
-RAISE NOTICE '============================================================';
-RAISE NOTICE 'SUCCESS: ALL PHASE 1 EXHAUSTIVE RLS & INTEGRITY TESTS PASSED';
-RAISE NOTICE '============================================================';
+-- ------------------------------------------------------------------------------
+-- TEST 23: Complete RLS Activation Across Public Tables (is())
+-- ------------------------------------------------------------------------------
+RESET ROLE;
+SELECT is(
+    count(*)::int, 12,
+    'All 12 public tables have active Row Level Security'
+) FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity = true;
+
+-- 4. Finish pgTAP Execution
+SELECT * FROM finish();
 
 ROLLBACK;
