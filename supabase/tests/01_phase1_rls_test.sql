@@ -59,20 +59,26 @@ VALUES
     ('88888888-8888-8888-8888-888888888888', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'grace@test.com', '', now(), '{"provider":"email","providers":["email"]}'::jsonb, '{"full_name": "Grace Moderator"}'::jsonb, now(), now())
 ON CONFLICT (id) DO NOTHING;
 
-UPDATE public.profiles SET username = 'alice', onboarded = true WHERE id = '11111111-1111-1111-1111-111111111111';
-UPDATE public.profiles SET username = 'bob', onboarded = true WHERE id = '22222222-2222-2222-2222-222222222222';
-UPDATE public.profiles SET username = 'charlie', onboarded = true WHERE id = '33333333-3333-3333-3333-333333333333';
-UPDATE public.profiles SET username = 'dave', onboarded = true WHERE id = '44444444-4444-4444-4444-444444444444';
-UPDATE public.profiles SET username = 'eve', onboarded = true WHERE id = '55555555-5555-5555-5555-555555555555';
-UPDATE public.profiles SET username = 'frank', onboarded = true WHERE id = '66666666-6666-6666-6666-666666666666';
-UPDATE public.profiles SET username = 'grace', onboarded = true WHERE id = '88888888-8888-8888-8888-888888888888';
+INSERT INTO public.profiles (id, username, display_name, onboarded)
+VALUES 
+    ('11111111-1111-1111-1111-111111111111', 'alice', 'Alice Wonderland', true),
+    ('22222222-2222-2222-2222-222222222222', 'bob', 'Bob Builder', true),
+    ('33333333-3333-3333-3333-333333333333', 'charlie', 'Charlie Chaplin', true),
+    ('44444444-4444-4444-4444-444444444444', 'dave', 'Dave Dangerous', true),
+    ('55555555-5555-5555-5555-555555555555', 'eve', 'Eve Administrator', true),
+    ('66666666-6666-6666-6666-666666666666', 'frank', 'Frank Scoped', true),
+    ('88888888-8888-8888-8888-888888888888', 'grace', 'Grace Moderator', true)
+ON CONFLICT (id) DO UPDATE SET 
+    username = EXCLUDED.username, 
+    display_name = EXCLUDED.display_name, 
+    onboarded = EXCLUDED.onboarded;
 
 -- Staff Roles: Eve = Admin, Grace = Moderator
+DELETE FROM public.staff_roles WHERE user_id IN ('55555555-5555-5555-5555-555555555555', '88888888-8888-8888-8888-888888888888');
 INSERT INTO public.staff_roles (user_id, role)
 VALUES 
     ('55555555-5555-5555-5555-555555555555', 'admin'),
-    ('88888888-8888-8888-8888-888888888888', 'moderator')
-ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role;
+    ('88888888-8888-8888-8888-888888888888', 'moderator');
 
 -- Bans Fixtures:
 -- Dave: ACTIVE global ban (expires in 10 days)
@@ -354,21 +360,21 @@ SELECT lives_ok(
 RESET ROLE;
 SELECT set_actor('44444444-4444-4444-4444-444444444444'); -- Dave (Active ban)
 SELECT throws_ok(
-    $$ INSERT INTO public.show_progress (user_id, show_id, season_number, episode_number) VALUES ('44444444-4444-4444-4444-444444444444', 301, 1, 1) $$,
+    $$ INSERT INTO public.show_progress (user_id, show_id, season, episode) VALUES ('44444444-4444-4444-4444-444444444444', 301, 1, 1) $$,
     '42501', NULL, 'Active ban rejects show_progress insert'
 );
 
 RESET ROLE;
 SELECT set_actor('33333333-3333-3333-3333-333333333333'); -- Charlie (Expired ban)
 SELECT lives_ok(
-    $$ INSERT INTO public.show_progress (user_id, show_id, season_number, episode_number) VALUES ('33333333-3333-3333-3333-333333333333', 301, 1, 1) $$,
+    $$ INSERT INTO public.show_progress (user_id, show_id, season, episode) VALUES ('33333333-3333-3333-3333-333333333333', 301, 1, 1) $$,
     'Expired ban allows show_progress insert'
 );
 
 RESET ROLE;
 SELECT set_actor('22222222-2222-2222-2222-222222222222'); -- Bob (Unbanned)
 SELECT lives_ok(
-    $$ INSERT INTO public.show_progress (user_id, show_id, season_number, episode_number) VALUES ('22222222-2222-2222-2222-222222222222', 301, 1, 1) $$,
+    $$ INSERT INTO public.show_progress (user_id, show_id, season, episode) VALUES ('22222222-2222-2222-2222-222222222222', 301, 1, 1) $$,
     'Unbanned user allows show_progress insert'
 );
 
